@@ -856,6 +856,18 @@ static bool refresh_state( drm_t *drm )
 
 	drmModeFreeResources(resources);
 
+	struct plane *some_primary = nullptr;
+	for (size_t i = 0; i < drm->planes.size(); i++) {
+		struct plane *plane = &drm->planes[i];
+		if (!get_object_properties(drm, plane->id, DRM_MODE_OBJECT_PLANE, plane->props, plane->initial_prop_values)) {
+			return false;
+		}
+		uint64_t plane_type = drm->planes[i].initial_prop_values["type"];
+		if (!some_primary && plane_type == DRM_PLANE_TYPE_PRIMARY) {
+			some_primary = plane;
+		}
+	}
+
 	// Re-probe connectors props and status
 	for (auto &kv : drm->connectors) {
 		struct connector *conn = &kv.second;
@@ -895,15 +907,49 @@ static bool refresh_state( drm_t *drm )
 		if (!conn->possible_crtcs)
 			drm_log.errorf_errno("drmModeConnectorGetPossibleCrtcs failed");
 
-		conn->has_colorspace = conn->props.contains( "Colorspace" );
-		conn->has_hdr_output_metadata = conn->props.contains( "HDR_OUTPUT_METADATA" );
+		if (conn->props.contains("Colorspace"))
+		{
+			conn->has_colorspace = COLOR_PROP_Colorspace;
+		}
+		else if (some_primary->props.contains("NV_INPUT_COLORSPACE"))
+		{
+			conn->has_colorspace = COLOR_PROP_NV_INPUT_COLORSPACE;
+		} else {
+			conn->has_colorspace = COLOR_PROP_NONE;
+		}
+		if (conn->props.contains("HDR_OUTPUT_METADATA"))
+		{
+			conn->has_hdr_output_metadata = HDR_PROP_HDR_OUTPUT_METADATA;
+		}
+		else if (some_primary->props.contains("NV_HDR_STATIC_METADATA"))
+		{
+			conn->has_hdr_output_metadata = HDR_PROP_NV_HDR_STATIC_METADATA;
+		}
+		else {
+			conn->has_hdr_output_metadata = HDR_PROP_NONE;
+		}
 		conn->has_content_type = conn->props.contains( "content type" );
 
 		conn->current.crtc_id = conn->initial_prop_values["CRTC_ID"];
 		if (conn->has_colorspace)
-			conn->current.colorspace = conn->initial_prop_values["Colorspace"];
-		if (conn->has_hdr_output_metadata)
+		{
+			if (conn->has_colorspace == COLOR_PROP_Colorspace)
+			{
+				conn->current.colorspace = some_primary->initial_prop_values["Colorspace"];
+			}
+			else if (conn->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE)
+			{
+				conn->current.colorspace = some_primary->initial_prop_values["NV_INPUT_COLORSPACE"];
+			}
+		}
+		if (conn->has_hdr_output_metadata == HDR_PROP_HDR_OUTPUT_METADATA)
+		{
 			conn->current.hdr_output_metadata = std::make_shared<wlserver_hdr_metadata>(nullptr, conn->initial_prop_values["HDR_OUTPUT_METADATA"], false);
+		}
+		else if (conn->has_hdr_output_metadata == HDR_PROP_NV_HDR_STATIC_METADATA)
+		{
+			conn->current.hdr_output_metadata = std::make_shared<wlserver_hdr_metadata>(nullptr, some_primary->initial_prop_values["NV_HDR_STATIC_METADATA"], false);
+		}
 		if (conn->has_content_type)
 			conn->current.content_type = conn->initial_prop_values["content type"];
 
@@ -944,13 +990,6 @@ static bool refresh_state( drm_t *drm )
 			drm->current.vrr_enabled = crtc->initial_prop_values["VRR_ENABLED"];
 		if (crtc->has_valve1_regamma_tf)
 			drm->current.output_tf = (drm_valve1_transfer_function) crtc->initial_prop_values["VALVE1_CRTC_REGAMMA_TF"];
-	}
-
-	for (size_t i = 0; i < drm->planes.size(); i++) {
-		struct plane *plane = &drm->planes[i];
-		if (!get_object_properties(drm, plane->id, DRM_MODE_OBJECT_PLANE, plane->props, plane->initial_prop_values)) {
-			return false;
-		}
 	}
 
 	return true;
@@ -1430,14 +1469,21 @@ void finish_drm(struct drm_t *drm)
 	for ( auto &kv : drm->connectors ) {
 		struct connector *conn = &kv.second;
 		add_connector_property(req, conn, "CRTC_ID", 0);
-		if (conn->has_colorspace)
+		if (conn->has_colorspace == COLOR_PROP_Colorspace) {
 			add_connector_property(req, conn, "Colorspace", 0);
+		} else if (conn->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE) {
+			add_plane_property(req, drm->primary, "NV_INPUT_COLORSPACE", 0);
+		}
 		// HACK HACK: Setting to 0 doesn't disable HDR properly.
 		// Set an SDR metadata blob.
-		if (conn->has_hdr_output_metadata)
+		if (conn->has_hdr_output_metadata == HDR_PROP_HDR_OUTPUT_METADATA)
 		{
 			auto metadata = get_default_hdr_metadata( drm, conn );
 			add_connector_property(req, conn, "HDR_OUTPUT_METADATA", metadata ? metadata->blob : 0);
+		} else if (conn->has_hdr_output_metadata == HDR_PROP_NV_HDR_STATIC_METADATA)
+		{
+			auto metadata = get_default_hdr_metadata(drm, conn);
+			add_plane_property(req, drm->primary, "NV_HDR_STATIC_METADATA", metadata ? metadata->blob : 0);
 		}
 		if (conn->has_content_type)
 			add_connector_property(req, conn, "content type", 0);
@@ -2371,9 +2417,13 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	bool bConnectorSupportsHDR = drm->connector->metadata.supportsST2084;
 	bool bConnectorHDR = g_bOutputHDREnabled && bConnectorSupportsHDR;
 
-	if (drm->connector != nullptr) {
-		if (drm->connector->has_colorspace) {
-			drm->connector->pending.colorspace = ( bConnectorHDR ) ? DRM_MODE_COLORIMETRY_BT2020_RGB : DRM_MODE_COLORIMETRY_DEFAULT;
+	if (drm->connector != nullptr)
+	{
+		if (drm->connector->has_colorspace == COLOR_PROP_Colorspace)
+		{
+			drm->connector->pending.colorspace = (bConnectorHDR) ? DRM_MODE_COLORIMETRY_BT2020_RGB : DRM_MODE_COLORIMETRY_DEFAULT;
+		} else if (drm->connector->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE) {
+			drm->connector->pending.colorspace = (bConnectorHDR) ? 2 : 0;
 		}
 
 		if (drm->connector->has_content_type) {
@@ -2453,14 +2503,22 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			if (ret < 0)
 				return ret;
 
-			if (conn->has_colorspace) {
+			if (conn->has_colorspace == COLOR_PROP_Colorspace) {
 				ret = add_connector_property( drm->req, conn, "Colorspace", 0 );
+				if (ret < 0)
+					return ret;
+			} else if (conn->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE) {
+				ret = add_plane_property( drm->req, drm->primary, "NV_INPUT_COLORSPACE", 0 );
 				if (ret < 0)
 					return ret;
 			}
 
-			if (conn->has_hdr_output_metadata) {
+			if (conn->has_hdr_output_metadata == HDR_PROP_HDR_OUTPUT_METADATA) {
 				ret = add_connector_property( drm->req, conn, "HDR_OUTPUT_METADATA", 0 );
+				if (ret < 0)
+					return ret;
+			} else if (conn->has_hdr_output_metadata == HDR_PROP_NV_HDR_STATIC_METADATA) {
+				ret = add_plane_property( drm->req, drm->primary, "NV_HDR_STATIC_METADATA", 0 );
 				if (ret < 0)
 					return ret;
 			}
@@ -2541,15 +2599,24 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			if (ret < 0)
 				return ret;
 
-			if (drm->connector->has_colorspace) {
+			if (drm->connector->has_colorspace == COLOR_PROP_Colorspace) {
 				ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
+				if (ret < 0)
+					return ret;
+			} else if (drm->connector->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE) {
+				ret = add_plane_property(drm->req, drm->primary, "NV_INPUT_COLORSPACE", drm->connector->pending.colorspace);
 				if (ret < 0)
 					return ret;
 			}
 
-			if (drm->connector->has_hdr_output_metadata) {
+			if (drm->connector->has_hdr_output_metadata == HDR_PROP_HDR_OUTPUT_METADATA) {
 				uint32_t value = drm->connector->pending.hdr_output_metadata ? drm->connector->pending.hdr_output_metadata->blob : 0;
 				ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", value);
+				if (ret < 0)
+					return ret;
+			} else if (drm->connector->has_hdr_output_metadata == HDR_PROP_NV_HDR_STATIC_METADATA) {
+				uint32_t value = drm->connector->pending.hdr_output_metadata ? drm->connector->pending.hdr_output_metadata->blob : 0;
+				ret = add_plane_property(drm->req, drm->primary, "NV_HDR_STATIC_METADATA", value);
 				if (ret < 0)
 					return ret;
 			}
@@ -2587,17 +2654,27 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	else
 	{
 		if (drm->connector != nullptr) {
-			if (drm->connector->has_colorspace && drm->connector->pending.colorspace != drm->connector->current.colorspace) {
+			if (drm->connector->has_colorspace == COLOR_PROP_Colorspace && drm->connector->pending.colorspace != drm->connector->current.colorspace) {
 				int ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
+				if (ret < 0)
+					return ret;
+			} else if (drm->connector->has_colorspace == COLOR_PROP_NV_INPUT_COLORSPACE && drm->connector->pending.colorspace != drm->connector->current.colorspace) {
+				int ret = add_plane_property(drm->req, drm->primary, "NV_INPUT_COLORSPACE", drm->connector->pending.colorspace);
 				if (ret < 0)
 					return ret;
 			}
 
 			if (drm->connector->has_hdr_output_metadata && drm->connector->pending.hdr_output_metadata != drm->connector->current.hdr_output_metadata) {
 				uint32_t value = drm->connector->pending.hdr_output_metadata ? drm->connector->pending.hdr_output_metadata->blob : 0;
-				int ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", value);
-				if (ret < 0)
-					return ret;
+				if (drm->connector->has_hdr_output_metadata == HDR_PROP_HDR_OUTPUT_METADATA) {
+					int ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", value);
+					if (ret < 0)
+						return ret;
+				} else if (drm->connector->has_hdr_output_metadata == HDR_PROP_NV_HDR_STATIC_METADATA) {
+					int ret = add_plane_property(drm->req, drm->primary, "NV_HDR_STATIC_METADATA", value);
+					if (ret < 0)
+						return ret;
+				}
 			}
 
 			if (drm->connector->has_content_type && drm->connector->pending.content_type != drm->connector->current.content_type) {

@@ -134,6 +134,20 @@ struct connector_metadata_t {
    EOTF eotf = EOTF_Gamma22;
 };
 
+enum drm_hdr_property
+{
+	HDR_PROP_NONE,
+	HDR_PROP_HDR_OUTPUT_METADATA,
+	HDR_PROP_NV_HDR_STATIC_METADATA,
+};
+
+enum drm_colorspace_property
+{
+	COLOR_PROP_NONE,
+	COLOR_PROP_Colorspace,
+	COLOR_PROP_NV_INPUT_COLORSPACE,
+};
+
 struct connector {
 	uint32_t id;
 	char *name;
@@ -161,9 +175,9 @@ struct connector {
 
 	std::vector<uint8_t> edid_data;
 
-	bool has_colorspace;
+	enum drm_colorspace_property has_colorspace;
 	bool has_content_type;
-	bool has_hdr_output_metadata;
+	enum drm_hdr_property has_hdr_output_metadata;
 };
 
 struct fb {
